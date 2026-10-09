@@ -1,0 +1,13 @@
+{
+  "name": "laravel-log-email-inspector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Inbox-style viewer for emails written to laravel.log by the log mail driver",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "mailparser": "^3.9.37"
+  }
+}
