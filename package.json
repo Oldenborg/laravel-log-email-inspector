@@ -8,6 +8,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "mailparser": "^3.9.37"
+    "mailparser": "^3.9.37",
+    "marked": "^18.1.0"
   }
 }

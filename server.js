@@ -1,8 +1,10 @@
 import http from 'node:http'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { simpleParser } from 'mailparser'
+import { renderPreview } from './blade.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 try {
@@ -17,6 +19,10 @@ if (!LOG_PATH) {
   console.error('LOG_PATH is not set. Copy .env.example to .env and set it.')
   process.exit(1)
 }
+
+// The Laravel app root; defaults to the directory containing storage/logs/laravel.log
+const storageIdx = LOG_PATH.lastIndexOf(`${path.sep}storage${path.sep}`)
+const LARAVEL_PATH = process.env.LARAVEL_PATH ?? (storageIdx === -1 ? null : LOG_PATH.slice(0, storageIdx))
 
 // Laravel log entries start with "[YYYY-MM-DD HH:MM:SS] env.LEVEL: "
 const ENTRY_START = /^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (\w+)\.(\w+): /m
@@ -80,6 +86,72 @@ async function loadEmails() {
   return emails
 }
 
+async function walk(dir) {
+  const files = []
+  let entries
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true })
+  } catch (err) {
+    if (err.code === 'ENOENT') return files
+    throw err
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) files.push(...(await walk(full)))
+    else files.push(full)
+  }
+  return files
+}
+
+// Directories whose blade files are considered mail templates even without a class reference
+const MAIL_DIR = /(^|\/)(mail|mails|email|emails)(\/|$)/
+const MAIL_COMPONENT = /<x-mail::|@component\(\s*['"]mail::/
+// Matches ->view('a.b') / ->markdown(...) / ->text(...) and Content(view: 'a.b', markdown: ...)
+const VIEW_REF = /(?:->\s*(?:view|markdown|text|html)\s*\(\s*|\b(?:view|markdown|text|html)\s*:\s*)['"]([\w./-]+)['"]/g
+
+// App name shown in the preview's mail theme header/footer, read from the Laravel .env
+async function laravelAppName() {
+  const env = await fs.readFile(path.join(LARAVEL_PATH, '.env'), 'utf8').catch(() => '')
+  const m = env.match(/^APP_NAME=(.*)$/m)
+  return m ? m[1].trim().replace(/^(["'])(.*)\1$/, '$2') : 'Laravel'
+}
+
+async function loadTemplates() {
+  if (!LARAVEL_PATH) return null
+  const viewsDir = path.join(LARAVEL_PATH, 'resources', 'views')
+
+  // Map view name ("mail.welcome") -> Mailable/Notification classes referencing it
+  const usedBy = new Map()
+  for (const dir of ['app/Mail', 'app/Notifications']) {
+    for (const file of await walk(path.join(LARAVEL_PATH, dir))) {
+      if (!file.endsWith('.php')) continue
+      const src = await fs.readFile(file, 'utf8')
+      for (const m of src.matchAll(VIEW_REF)) {
+        const name = m[1].replace(/\//g, '.')
+        if (!usedBy.has(name)) usedBy.set(name, [])
+        usedBy.get(name).push({ class: path.basename(file, '.php'), file: path.relative(LARAVEL_PATH, file) })
+      }
+    }
+  }
+
+  const templates = []
+  for (const file of await walk(viewsDir)) {
+    if (!file.endsWith('.blade.php')) continue
+    const rel = path.relative(LARAVEL_PATH, file).split(path.sep).join('/')
+    if (rel.startsWith('resources/views/vendor/')) continue // published vendor templates are noise, not app templates
+    const name = path.relative(viewsDir, file).replace(/\.blade\.php$/, '').split(path.sep).join('.')
+    const source = await fs.readFile(file, 'utf8')
+    const markdown = MAIL_COMPONENT.test(source)
+    const classes = usedBy.get(name) ?? []
+    if (!classes.length && !markdown && !MAIL_DIR.test(rel.slice('resources/views/'.length))) continue
+    const stat = await fs.stat(file)
+    templates.push({ name, path: rel, markdown, usedBy: classes, size: stat.size, modified: stat.mtime.toISOString(), source })
+  }
+  templates.sort((a, b) => a.name.localeCompare(b.name))
+  templates.forEach((t, i) => (t.id = i))
+  return templates
+}
+
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css' }
 
 http
@@ -99,6 +171,35 @@ http
         res.writeHead(email ? 200 : 404, { 'content-type': 'application/json' })
         return res.end(JSON.stringify(email ?? { error: 'Not found' }))
       }
+      if (url.pathname === '/api/templates') {
+        const templates = await loadTemplates()
+        if (!templates) {
+          res.writeHead(404, { 'content-type': 'application/json' })
+          return res.end(JSON.stringify({ error: 'Laravel root not found. Set LARAVEL_PATH in .env (LOG_PATH does not contain /storage/).' }))
+        }
+        const list = templates.map(({ source, ...rest }) => rest)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end(JSON.stringify({ laravelPath: LARAVEL_PATH, templates: list }))
+      }
+      const t = url.pathname.match(/^\/api\/templates\/(\d+)$/)
+      if (t) {
+        const template = ((await loadTemplates()) ?? []).find((x) => x.id === Number(t[1]))
+        if (!template) {
+          res.writeHead(404, { 'content-type': 'application/json' })
+          return res.end(JSON.stringify({ error: 'Not found' }))
+        }
+        const classes = await Promise.all(
+          template.usedBy.map(async (u) => ({ ...u, source: await fs.readFile(path.join(LARAVEL_PATH, u.file), 'utf8').catch(() => '(could not read file)') }))
+        )
+        let preview
+        try {
+          preview = renderPreview(template.source, { markdown: template.markdown, appName: await laravelAppName() })
+        } catch (err) {
+          preview = null
+        }
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end(JSON.stringify({ ...template, classes, preview }))
+      }
       const file = url.pathname === '/' ? '/index.html' : url.pathname
       const full = path.join(__dirname, 'public', path.normalize(file))
       if (!full.startsWith(path.join(__dirname, 'public'))) throw Object.assign(new Error('forbidden'), { code: 'EACCES' })
@@ -111,4 +212,11 @@ http
       res.end(JSON.stringify({ error: err.code === 'ENOENT' ? `Not found: ${err.path ?? url.pathname}` : err.message }))
     }
   })
-  .listen(PORT, '127.0.0.1', () => console.log(`Laravel Log Email Inspector: http://localhost:${PORT}\nReading ${LOG_PATH}`))
+  .listen(PORT, '127.0.0.1', () => {
+    const url = `http://localhost:${PORT}`
+    console.log(`Laravel Log Email Inspector: ${url}\nReading ${LOG_PATH}`)
+    if (process.env.OPEN !== 'false') {
+      const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open'
+      spawn(cmd, [url], { shell: process.platform === 'win32', stdio: 'ignore', detached: true }).on('error', () => {}).unref()
+    }
+  })

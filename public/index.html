@@ -32,6 +32,12 @@
   .tabs { display:flex; gap:4px; padding:6px 18px 0; border-bottom:1px solid var(--line); }
   .tabs button { background:none; border:0; border-bottom:2px solid transparent; padding:6px 10px; color:var(--muted); cursor:pointer; font:inherit; }
   .tabs button.on { color:var(--accent); border-color:var(--accent); }
+  nav { display:flex; gap:2px; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  nav button { background:none; border:0; padding:6px 12px; color:var(--muted); cursor:pointer; font:inherit; }
+  nav button.on { background:var(--sel); color:var(--fg); }
+  .row .name { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row .path { color:var(--muted); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .badge { display:inline-block; padding:0 6px; margin-left:6px; border-radius:8px; font-size:11px; font-weight:400; background:var(--sel); color:var(--fg); vertical-align:1px; }
   #body { flex:1; min-height:0; overflow:auto; }
   iframe { width:100%; height:100%; border:0; background:#fff; }
   pre { margin:0; padding:16px 18px; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 ui-monospace,Menlo,monospace; }
@@ -41,6 +47,10 @@
 <body>
 <header>
   <h1>📬 Laravel Log Email Inspector</h1>
+  <nav>
+    <button id="nav-inbox" class="on">Inbox</button>
+    <button id="nav-templates">Templates</button>
+  </nav>
   <input id="q" type="search" placeholder="Search subject, sender, recipient, body…">
   <span class="meta" id="meta"></span>
 </header>
@@ -51,6 +61,7 @@
 <script>
 const $ = (s) => document.querySelector(s)
 let emails = [], selected = null, tab = 'html', lastSig = ''
+let view = 'inbox', templates = [], selectedTpl = null, tplError = '', lastTplSig = ''
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 const who = (a) => a.name ? `${a.name} <${a.address}>` : a.address
 const short = (list) => list.map((a) => a.name || a.address).join(', ')
@@ -69,6 +80,7 @@ function matches(e, q) {
 }
 
 function renderList() {
+  if (view === 'templates') return renderTemplateList()
   const rows = emails.filter((e) => matches(e, $('#q').value))
   $('#list').innerHTML = rows.length ? rows.map((e) => `
     <div class="row ${e.id === selected ? 'sel' : ''}" data-id="${e.id}">
@@ -77,6 +89,54 @@ function renderList() {
       <div class="preview">${esc(e.preview)}</div>
       <div class="to">to ${esc(short(e.to))}</div>
     </div>`).join('') : '<div class="empty">No emails found in the log</div>'
+}
+
+function tplMatches(t, q) {
+  if (!q) return true
+  return [t.name, t.path, ...t.usedBy.map((u) => u.class)].join(' ').toLowerCase().includes(q.toLowerCase())
+}
+
+function renderTemplateList() {
+  if (tplError) return ($('#list').innerHTML = `<div class="empty">${esc(tplError)}</div>`)
+  const rows = templates.filter((t) => tplMatches(t, $('#q').value))
+  $('#list').innerHTML = rows.length ? rows.map((t) => `
+    <div class="row ${t.id === selectedTpl ? 'sel' : ''}" data-id="${t.id}">
+      <div class="name">${esc(t.name)}${t.markdown ? '<span class="badge">markdown</span>' : ''}</div>
+      <div class="path">${esc(t.path)}</div>
+      ${t.usedBy.length ? `<div class="to">used by ${esc(t.usedBy.map((u) => u.class).join(', '))}</div>` : ''}
+    </div>`).join('') : '<div class="empty">No mail templates found</div>'
+}
+
+async function selectTemplate(id) {
+  selectedTpl = id
+  renderTemplateList()
+  const t = await (await fetch(`/api/templates/${id}`)).json()
+  const row = (k, v) => v ? `<dt>${k}</dt><dd>${v}</dd>` : ''
+  $('#detail').innerHTML = `
+    <div id="head">
+      <h2>${esc(t.name)}${t.markdown ? '<span class="badge">markdown</span>' : ''}</h2>
+      <dl>
+        ${row('Path', esc(t.path))}
+        ${row('Used by', t.classes.map((c) => `<span class="chip">${esc(c.class)}</span>`).join(''))}
+        ${row('Modified', esc(new Date(t.modified).toLocaleString()))}
+        ${row('Size', `${t.size} B`)}
+      </dl>
+    </div>
+    <div class="tabs">${['Preview', 'Blade', ...t.classes.map((c) => c.class)].map((n, i) => `<button data-tab="${i}">${esc(n)}</button>`).join('')}</div>
+    <div id="body"></div>`
+  const show = (i) => {
+    document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', Number(b.dataset.tab) === i))
+    const body = $('#body')
+    if (i === 0) {
+      if (!t.preview) return (body.innerHTML = '<div class="empty">Could not render a preview for this template</div>')
+      body.innerHTML = '<iframe sandbox></iframe>'
+      body.firstChild.srcdoc = t.preview
+    } else {
+      body.innerHTML = `<pre>${esc(i === 1 ? t.source : t.classes[i - 2].source)}</pre>`
+    }
+  }
+  document.querySelectorAll('.tabs button').forEach((b) => (b.onclick = () => show(Number(b.dataset.tab))))
+  show(0)
 }
 
 async function select(id) {
@@ -118,18 +178,56 @@ async function select(id) {
 async function load() {
   const data = await (await fetch('/api/emails')).json()
   const sig = data.emails.map((e) => e.id + e.messageId).join()
-  $('#meta').textContent = `${data.emails.length} emails · ${data.logPath}`
+  if (view === 'inbox') $('#meta').textContent = `${data.emails.length} emails · ${data.logPath}`
   if (sig === lastSig) return
   lastSig = sig
   emails = data.emails
+  if (view !== 'inbox') return
   if (selected === null && emails.length) return select(emails[0].id)
   renderList()
 }
 
-$('#list').onclick = (ev) => { const r = ev.target.closest('.row'); if (r) select(Number(r.dataset.id)) }
+async function loadTemplates() {
+  const data = await (await fetch('/api/templates')).json()
+  tplError = data.error ?? ''
+  templates = data.templates ?? []
+  const sig = tplError + templates.map((t) => t.name + t.modified).join()
+  if (view === 'templates') $('#meta').textContent = tplError ? '' : `${templates.length} templates · ${data.laravelPath}`
+  if (sig === lastTplSig) return
+  lastTplSig = sig
+  if (view !== 'templates') return
+  if (selectedTpl === null && templates.length) return selectTemplate(templates[0].id)
+  if (selectedTpl !== null && !templates.some((t) => t.id === selectedTpl)) selectedTpl = null
+  renderTemplateList()
+}
+
+function setView(v) {
+  view = v
+  $('#nav-inbox').classList.toggle('on', v === 'inbox')
+  $('#nav-templates').classList.toggle('on', v === 'templates')
+  $('#q').placeholder = v === 'inbox' ? 'Search subject, sender, recipient, body…' : 'Search template name, path, class…'
+  $('#detail').innerHTML = `<div class="empty">Select ${v === 'inbox' ? 'an email' : 'a template'}</div>`
+  if (v === 'inbox') {
+    lastSig = ''
+    if (selected !== null) select(selected)
+    load()
+  } else {
+    lastTplSig = ''
+    if (selectedTpl !== null) selectTemplate(selectedTpl)
+    loadTemplates()
+  }
+  renderList()
+}
+
+$('#nav-inbox').onclick = () => setView('inbox')
+$('#nav-templates').onclick = () => setView('templates')
+$('#list').onclick = (ev) => {
+  const r = ev.target.closest('.row')
+  if (r) view === 'inbox' ? select(Number(r.dataset.id)) : selectTemplate(Number(r.dataset.id))
+}
 $('#q').oninput = renderList
 load()
-setInterval(load, 3000)
+setInterval(() => (view === 'inbox' ? load() : loadTemplates()), 3000)
 </script>
 </body>
 </html>
